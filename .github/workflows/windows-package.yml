@@ -20,8 +20,6 @@ jobs:
     runs-on: windows-latest
     env:
       PROJECT_PATH: PictureEncryptionApp/PictureEncryptionApp.csproj
-      PUBLISH_DIR: ${{ runner.temp }}\PictureEncryptionApp\publish
-      INSTALLER_DIR: ${{ runner.temp }}\PictureEncryptionApp\installer
 
     steps:
       - name: 检出代码
@@ -60,11 +58,17 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: 准备输出目录
+      - name: 设置输出目录
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path $env:PUBLISH_DIR | Out-Null
-          New-Item -ItemType Directory -Force -Path $env:INSTALLER_DIR | Out-Null
+          $publishDir = Join-Path $env:RUNNER_TEMP 'PictureEncryptionApp\publish'
+          $installerDir = Join-Path $env:RUNNER_TEMP 'PictureEncryptionApp\installer'
+
+          "PUBLISH_DIR=$publishDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "INSTALLER_DIR=$installerDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          New-Item -ItemType Directory -Force -Path $publishDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $installerDir | Out-Null
 
       - name: 还原依赖
         run: dotnet restore ${{ env.PROJECT_PATH }}
