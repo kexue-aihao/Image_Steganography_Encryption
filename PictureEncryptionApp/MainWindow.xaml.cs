@@ -23,12 +23,22 @@ public partial class MainWindow : Window
 
     private void InitializeViewState()
     {
+        EncryptionProfileComboBox.ItemsSource = PictureSteganographyService.SupportedEncryptionProfiles
+            .Select(profile => new EncryptionProfileOption(profile))
+            .ToList();
+        EncryptionProfileComboBox.DisplayMemberPath = nameof(EncryptionProfileOption.DisplayName);
+        EncryptionProfileComboBox.SelectedValuePath = nameof(EncryptionProfileOption.Profile);
+        EncryptionProfileComboBox.SelectedValue = EncryptionProfile.Aes256Gcm;
+
         EmbedTextRadioButton.IsChecked = true;
         EmbedFilePanel.Visibility = Visibility.Collapsed;
         EmbedStatusTextBox.Text = "就绪。请选择载体图片，开始适配性分析。";
         EmbedAssessmentTextBox.Text = "只有载体通过自适应适配性门禁后，才能启用嵌入流程。";
         EmbedCapacityTextBlock.Text = "尚未选择载体图片。";
         EmbedSupportTextBlock.Text = "适配性门禁正在等待图片输入。";
+        UpdateEncryptionProfileUi();
+        ExtractPasswordRadioButton.IsChecked = true;
+        ExtractPrivateKeyPanel.Visibility = Visibility.Collapsed;
         ExtractResultTextBox.Text = string.Empty;
         ExtractMetadataTextBlock.Text = "尚未开始提取。";
         ExtractOutputFolderTextBox.Text = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
@@ -66,6 +76,18 @@ public partial class MainWindow : Window
         UpdateEmbedAssessment();
     }
 
+    private void BrowseRecipientPublicKeyButton_Click(object sender, RoutedEventArgs e)
+    {
+        string? path = SelectFile("选择接收者 ML-KEM 公钥", "PEM 密钥|*.pem|所有文件|*.*");
+        if (path is null)
+        {
+            return;
+        }
+
+        RecipientPublicKeyPathTextBox.Text = path;
+        UpdateEmbedAssessment();
+    }
+
     private void BrowseEmbedOutputButton_Click(object sender, RoutedEventArgs e)
     {
         string initialPath = string.IsNullOrWhiteSpace(EmbedOutputPathTextBox.Text)
@@ -90,7 +112,15 @@ public partial class MainWindow : Window
 
     private async void EmbedActionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!ValidateEmbedInputs(out string carrierPath, out string password, out string outputPath, out string? secretFilePath, out string? secretText, out long requiredContainerBytes))
+        if (!ValidateEmbedInputs(
+                out string carrierPath,
+                out EncryptionProfile encryptionProfile,
+                out string password,
+                out string? recipientPublicKeyPath,
+                out string outputPath,
+                out string? secretFilePath,
+                out string? secretText,
+                out long requiredContainerBytes))
         {
             return;
         }
@@ -101,13 +131,23 @@ public partial class MainWindow : Window
         try
         {
             EmbedResult result = await Task.Run(() =>
-                secretFilePath is null
-                    ? PictureSteganographyService.EmbedText(carrierPath, secretText!, password, outputPath)
-                    : PictureSteganographyService.EmbedFile(carrierPath, secretFilePath, password, outputPath));
+            {
+                if (encryptionProfile == EncryptionProfile.MlKem1024Aes256Gcm)
+                {
+                    return secretFilePath is null
+                        ? PictureSteganographyService.EmbedTextForRecipient(carrierPath, secretText!, recipientPublicKeyPath!, outputPath)
+                        : PictureSteganographyService.EmbedFileForRecipient(carrierPath, secretFilePath, recipientPublicKeyPath!, outputPath);
+                }
+
+                return secretFilePath is null
+                    ? PictureSteganographyService.EmbedText(carrierPath, secretText!, password, outputPath, encryptionProfile)
+                    : PictureSteganographyService.EmbedFile(carrierPath, secretFilePath, password, outputPath, encryptionProfile);
+            });
 
             EmbedStatusTextBox.Text =
                 $"处理完成。{Environment.NewLine}" +
                 $"输出文件：{result.OutputPath}{Environment.NewLine}" +
+                $"加密算法：{PictureSteganographyService.GetEncryptionProfileDisplayName(result.EncryptionProfile)}{Environment.NewLine}" +
                 $"载体评分：{result.Assessment.SecurityScore}/100{Environment.NewLine}" +
                 $"已用自适应预算：{FormatBytes(requiredContainerBytes)} / 推荐 {FormatBytes(result.Assessment.RecommendedContainerBytes)}{Environment.NewLine}" +
                 $"秘密数据大小：{FormatBytes(result.SecretBytes)}{Environment.NewLine}" +
@@ -124,6 +164,47 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             EmbedStatusTextBox.Text = $"处理失败：{ex.Message}";
+        }
+        finally
+        {
+            ToggleBusyState(isBusy: false);
+        }
+    }
+
+    private async void GeneratePostQuantumKeysButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = "选择 ML-KEM 密钥保存目录",
+            InitialDirectory = GetExistingDirectory(EmbedOutputPathTextBox.Text),
+        };
+
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        ToggleBusyState(isBusy: true);
+        EmbedStatusTextBox.Text = "正在生成 ML-KEM-1024 后量子密钥对...";
+
+        try
+        {
+            PostQuantumKeyPairResult result = await Task.Run(() =>
+                PictureSteganographyService.GenerateMlKem1024KeyPair(dialog.FolderName));
+
+            RecipientPublicKeyPathTextBox.Text = result.PublicKeyPath;
+            EmbedStatusTextBox.Text =
+                $"ML-KEM-1024 密钥对已生成。{Environment.NewLine}" +
+                $"公钥：{result.PublicKeyPath}{Environment.NewLine}" +
+                $"私钥：{result.PrivateKeyPath}{Environment.NewLine}" +
+                $"公钥指纹：{result.Fingerprint}{Environment.NewLine}" +
+                $"公钥大小：{FormatBytes(result.PublicKeyBytes)}，私钥大小：{FormatBytes(result.PrivateKeyBytes)}{Environment.NewLine}" +
+                "请妥善保存私钥；丢失私钥后无法提取后量子模式图片中的载荷。";
+            UpdateEmbedAssessment();
+        }
+        catch (Exception ex)
+        {
+            EmbedStatusTextBox.Text = $"生成密钥失败：{ex.Message}";
         }
         finally
         {
@@ -163,10 +244,23 @@ public partial class MainWindow : Window
         }
     }
 
+    private void BrowseExtractPrivateKeyButton_Click(object sender, RoutedEventArgs e)
+    {
+        string? path = SelectFile("选择接收者 ML-KEM 私钥", "PEM 密钥|*.pem|所有文件|*.*");
+        if (path is null)
+        {
+            return;
+        }
+
+        ExtractPrivateKeyPathTextBox.Text = path;
+    }
+
     private async void ExtractActionButton_Click(object sender, RoutedEventArgs e)
     {
         string imagePath = ExtractImagePathTextBox.Text.Trim();
         string password = ExtractPasswordBox.Password;
+        string privateKeyPath = ExtractPrivateKeyPathTextBox.Text.Trim();
+        bool usePrivateKey = ExtractPrivateKeyRadioButton.IsChecked == true;
         string outputFolder = string.IsNullOrWhiteSpace(ExtractOutputFolderTextBox.Text)
             ? (Path.GetDirectoryName(imagePath) ?? Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory))
             : ExtractOutputFolderTextBox.Text.Trim();
@@ -177,9 +271,15 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(password))
+        if (!usePrivateKey && string.IsNullOrWhiteSpace(password))
         {
             ExtractMetadataTextBlock.Text = "请输入嵌入时使用的密码。";
+            return;
+        }
+
+        if (usePrivateKey && !File.Exists(privateKeyPath))
+        {
+            ExtractMetadataTextBlock.Text = "请选择有效的 ML-KEM 私钥文件。";
             return;
         }
 
@@ -189,17 +289,21 @@ public partial class MainWindow : Window
 
         try
         {
-            ExtractResult result = await Task.Run(() => PictureSteganographyService.Extract(imagePath, password, outputFolder));
+            ExtractResult result = await Task.Run(() =>
+                usePrivateKey
+                    ? PictureSteganographyService.ExtractWithPrivateKey(imagePath, privateKeyPath, outputFolder)
+                    : PictureSteganographyService.Extract(imagePath, password, outputFolder));
 
             if (result.PayloadKind == PayloadKind.Text)
             {
-                ExtractMetadataTextBlock.Text = $"提取完成。载荷类型：文本。大小：{FormatBytes(result.DataBytes)}";
+                ExtractMetadataTextBlock.Text =
+                    $"提取完成。算法：{PictureSteganographyService.GetEncryptionProfileDisplayName(result.EncryptionProfile)}。载荷类型：文本。大小：{FormatBytes(result.DataBytes)}";
                 ExtractResultTextBox.Text = result.TextContent ?? string.Empty;
             }
             else
             {
                 ExtractMetadataTextBlock.Text =
-                    $"提取完成。载荷类型：文件。大小：{FormatBytes(result.DataBytes)}。已保存到：{result.SavedFilePath}";
+                    $"提取完成。算法：{PictureSteganographyService.GetEncryptionProfileDisplayName(result.EncryptionProfile)}。载荷类型：文件。大小：{FormatBytes(result.DataBytes)}。已保存到：{result.SavedFilePath}";
                 ExtractResultTextBox.Text =
                     $"恢复文件：{result.FileName}{Environment.NewLine}{result.SavedFilePath}";
             }
@@ -236,6 +340,44 @@ public partial class MainWindow : Window
         }
 
         UpdateEmbedAssessment();
+    }
+
+    private void EncryptionProfileComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (PasswordModePanel is null)
+        {
+            return;
+        }
+
+        UpdateEncryptionProfileUi();
+        UpdateEmbedAssessment();
+    }
+
+    private void ExtractModeToggle_Checked(object sender, RoutedEventArgs e)
+    {
+        if (ExtractPasswordPanel is null || ExtractPrivateKeyPanel is null)
+        {
+            return;
+        }
+
+        bool usePrivateKey = ExtractPrivateKeyRadioButton.IsChecked == true;
+        ExtractPasswordPanel.Visibility = usePrivateKey ? Visibility.Collapsed : Visibility.Visible;
+        ExtractPrivateKeyPanel.Visibility = usePrivateKey ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void UpdateEncryptionProfileUi()
+    {
+        EncryptionProfile profile = GetSelectedEncryptionProfile();
+        bool isPostQuantum = profile == EncryptionProfile.MlKem1024Aes256Gcm;
+        PasswordModePanel.Visibility = isPostQuantum ? Visibility.Collapsed : Visibility.Visible;
+        RecipientPublicKeyPanel.Visibility = isPostQuantum ? Visibility.Visible : Visibility.Collapsed;
+        EncryptionProfileDescriptionTextBlock.Text = profile switch
+        {
+            EncryptionProfile.Aes256Gcm => "标准认证加密模式，兼容旧版隐写图片；适合大多数场景。",
+            EncryptionProfile.ChaCha20Poly1305 => "另一种现代 AEAD 方案，提供认证加密，适合作为 AES-GCM 的强备选。",
+            EncryptionProfile.MlKem1024Aes256Gcm => "使用 ML-KEM-1024 封装随机内容密钥，再用 AES-256-GCM 加密载荷；提取时需要接收者私钥。",
+            _ => string.Empty,
+        };
     }
 
     private void UpdateEmbedAssessment()
@@ -310,6 +452,7 @@ public partial class MainWindow : Window
     {
         var builder = new StringBuilder();
         builder.AppendLine($"判定结果：{assessment.Verdict}");
+        builder.AppendLine($"加密算法：{PictureSteganographyService.GetEncryptionProfileDisplayName(GetSelectedEncryptionProfile())}");
         builder.AppendLine($"安全评分：{assessment.SecurityScore}/100");
         builder.AppendLine($"自适应容量：{FormatBytes(assessment.AdaptiveCapacityBytes)}");
         builder.AppendLine($"推荐高对抗预算：{FormatBytes(assessment.RecommendedContainerBytes)}");
@@ -338,7 +481,8 @@ public partial class MainWindow : Window
                 : PictureSteganographyService.EstimateRequiredContainerBytes(
                     PayloadKind.Text,
                     fileName: null,
-                    dataLength: Encoding.UTF8.GetByteCount(text));
+                    dataLength: Encoding.UTF8.GetByteCount(text),
+                    GetSelectedEncryptionProfile());
         }
 
         string filePath = EmbedSecretFilePathTextBox.Text.Trim();
@@ -346,20 +490,25 @@ public partial class MainWindow : Window
             ? PictureSteganographyService.EstimateRequiredContainerBytes(
                 PayloadKind.File,
                 filePath,
-                new FileInfo(filePath).Length)
+                new FileInfo(filePath).Length,
+                GetSelectedEncryptionProfile())
             : 0;
     }
 
     private bool ValidateEmbedInputs(
         out string carrierPath,
+        out EncryptionProfile encryptionProfile,
         out string password,
+        out string? recipientPublicKeyPath,
         out string outputPath,
         out string? secretFilePath,
         out string? secretText,
         out long requiredContainerBytes)
     {
         carrierPath = EmbedCarrierPathTextBox.Text.Trim();
+        encryptionProfile = GetSelectedEncryptionProfile();
         password = EmbedPasswordBox.Password;
+        recipientPublicKeyPath = null;
         outputPath = EnsurePngPath(EmbedOutputPathTextBox.Text.Trim(), carrierPath);
         secretFilePath = null;
         secretText = null;
@@ -378,13 +527,23 @@ public partial class MainWindow : Window
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(password))
+        bool isPostQuantum = encryptionProfile == EncryptionProfile.MlKem1024Aes256Gcm;
+        if (isPostQuantum)
+        {
+            recipientPublicKeyPath = RecipientPublicKeyPathTextBox.Text.Trim();
+            if (!File.Exists(recipientPublicKeyPath))
+            {
+                EmbedStatusTextBox.Text = "后量子接收者模式需要选择有效的 ML-KEM 公钥文件。";
+                return false;
+            }
+        }
+        else if (string.IsNullOrWhiteSpace(password))
         {
             EmbedStatusTextBox.Text = "请输入密码。";
             return false;
         }
 
-        if (password != EmbedConfirmPasswordBox.Password)
+        if (!isPostQuantum && password != EmbedConfirmPasswordBox.Password)
         {
             EmbedStatusTextBox.Text = "两次输入的密码不一致。";
             return false;
@@ -402,7 +561,8 @@ public partial class MainWindow : Window
             requiredContainerBytes = PictureSteganographyService.EstimateRequiredContainerBytes(
                 PayloadKind.Text,
                 fileName: null,
-                dataLength: Encoding.UTF8.GetByteCount(secretText));
+                dataLength: Encoding.UTF8.GetByteCount(secretText),
+                encryptionProfile);
         }
         else
         {
@@ -416,7 +576,8 @@ public partial class MainWindow : Window
             requiredContainerBytes = PictureSteganographyService.EstimateRequiredContainerBytes(
                 PayloadKind.File,
                 secretFilePath,
-                new FileInfo(secretFilePath).Length);
+                new FileInfo(secretFilePath).Length,
+                encryptionProfile);
         }
 
         if (requiredContainerBytes > assessment.RecommendedContainerBytes)
@@ -439,6 +600,7 @@ public partial class MainWindow : Window
     private void ToggleBusyState(bool isBusy)
     {
         _isBusy = isBusy;
+        GeneratePostQuantumKeysButton.IsEnabled = !isBusy;
         ExtractActionButton.IsEnabled = !isBusy;
         UpdateEmbedActionState();
     }
@@ -453,6 +615,13 @@ public partial class MainWindow : Window
     {
         _currentAssessment = null;
         _currentAssessmentPath = null;
+    }
+
+    private EncryptionProfile GetSelectedEncryptionProfile()
+    {
+        return EncryptionProfileComboBox.SelectedValue is EncryptionProfile profile
+            ? profile
+            : EncryptionProfile.Aes256Gcm;
     }
 
     private static string? SelectFile(string title, string filter)
@@ -531,5 +700,10 @@ public partial class MainWindow : Window
         bitmap.EndInit();
         bitmap.Freeze();
         imageControl.Source = bitmap;
+    }
+
+    private sealed record EncryptionProfileOption(EncryptionProfile Profile)
+    {
+        public string DisplayName => PictureSteganographyService.GetEncryptionProfileDisplayName(Profile);
     }
 }

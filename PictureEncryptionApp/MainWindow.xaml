@@ -52,7 +52,7 @@
                        Foreground="#FF0F172A" />
             <TextBlock Margin="0,6,0,0"
                        Foreground="#FF475569"
-                       Text="Windows 10 / 11 桌面工具，支持 AES-GCM 加密、自适应图片门禁与高对抗隐写。" />
+                       Text="Windows 10 / 11 桌面工具，支持多种 AEAD 加密、ML-KEM 后量子接收者模式、自适应图片门禁与高对抗隐写。" />
         </StackPanel>
 
         <TabControl Grid.Row="1">
@@ -157,10 +157,49 @@
                             <Border Style="{StaticResource SectionBorderStyle}">
                                 <StackPanel>
                                     <TextBlock Style="{StaticResource SectionTitleStyle}" Text="安全设置" />
-                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="密码" />
-                                    <PasswordBox x:Name="EmbedPasswordBox" PasswordChanged="EmbedInputChanged" />
-                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="确认密码" />
-                                    <PasswordBox x:Name="EmbedConfirmPasswordBox" PasswordChanged="EmbedInputChanged" />
+                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="加密算法" />
+                                    <ComboBox x:Name="EncryptionProfileComboBox"
+                                              SelectionChanged="EncryptionProfileComboBox_SelectionChanged"
+                                              MinHeight="28" />
+                                    <TextBlock x:Name="EncryptionProfileDescriptionTextBlock"
+                                               Margin="0,8,0,0"
+                                               TextWrapping="Wrap"
+                                               Foreground="#FF475569" />
+
+                                    <StackPanel x:Name="PasswordModePanel">
+                                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="密码" />
+                                        <PasswordBox x:Name="EmbedPasswordBox" PasswordChanged="EmbedInputChanged" />
+                                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="确认密码" />
+                                        <PasswordBox x:Name="EmbedConfirmPasswordBox" PasswordChanged="EmbedInputChanged" />
+                                    </StackPanel>
+
+                                    <StackPanel x:Name="RecipientPublicKeyPanel" Visibility="Collapsed">
+                                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="接收者 ML-KEM 公钥" />
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBox x:Name="RecipientPublicKeyPathTextBox"
+                                                     Margin="0,0,10,0"
+                                                     IsReadOnly="True"
+                                                     VerticalContentAlignment="Center" />
+                                            <Button Grid.Column="1"
+                                                    Content="浏览..."
+                                                    Click="BrowseRecipientPublicKeyButton_Click" />
+                                        </Grid>
+                                    </StackPanel>
+
+                                    <Separator Margin="0,14,0,10" />
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button x:Name="GeneratePostQuantumKeysButton"
+                                                Content="生成 ML-KEM 密钥对"
+                                                Click="GeneratePostQuantumKeysButton_Click" />
+                                    </StackPanel>
+                                    <TextBlock Margin="0,8,0,0"
+                                               TextWrapping="Wrap"
+                                               Foreground="#FF64748B"
+                                               Text="后量子模式使用接收者公钥嵌入，接收者必须保管好私钥；私钥文件不会自动加口令保护。" />
                                 </StackPanel>
                             </Border>
 
@@ -260,8 +299,41 @@
                             <Border Style="{StaticResource SectionBorderStyle}">
                                 <StackPanel>
                                     <TextBlock Style="{StaticResource SectionTitleStyle}" Text="解密设置" />
-                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="密码" />
-                                    <PasswordBox x:Name="ExtractPasswordBox" />
+                                    <StackPanel Orientation="Horizontal">
+                                        <RadioButton x:Name="ExtractPasswordRadioButton"
+                                                     Content="密码模式"
+                                                     GroupName="ExtractMode"
+                                                     IsChecked="True"
+                                                     Checked="ExtractModeToggle_Checked" />
+                                        <RadioButton x:Name="ExtractPrivateKeyRadioButton"
+                                                     Margin="18,0,0,0"
+                                                     Content="ML-KEM 私钥模式"
+                                                     GroupName="ExtractMode"
+                                                     Checked="ExtractModeToggle_Checked" />
+                                    </StackPanel>
+
+                                    <StackPanel x:Name="ExtractPasswordPanel">
+                                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="密码" />
+                                        <PasswordBox x:Name="ExtractPasswordBox" />
+                                    </StackPanel>
+
+                                    <StackPanel x:Name="ExtractPrivateKeyPanel" Visibility="Collapsed">
+                                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="接收者 ML-KEM 私钥" />
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBox x:Name="ExtractPrivateKeyPathTextBox"
+                                                     Margin="0,0,10,0"
+                                                     IsReadOnly="True"
+                                                     VerticalContentAlignment="Center" />
+                                            <Button Grid.Column="1"
+                                                    Content="浏览..."
+                                                    Click="BrowseExtractPrivateKeyButton_Click" />
+                                        </Grid>
+                                    </StackPanel>
+
                                     <TextBlock Style="{StaticResource FieldLabelStyle}" Text="提取文件保存目录" />
                                     <Grid>
                                         <Grid.ColumnDefinitions>

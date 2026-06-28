@@ -5,6 +5,12 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using Org.BouncyCastle.Crypto;
+using Org.BouncyCastle.Crypto.Generators;
+using Org.BouncyCastle.Crypto.Kems;
+using Org.BouncyCastle.Crypto.Modes;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Security;
 
 namespace PictureEncryptionApp.Services;
 
@@ -12,6 +18,13 @@ public enum PayloadKind : byte
 {
     Text = 1,
     File = 2,
+}
+
+public enum EncryptionProfile : byte
+{
+    Aes256Gcm = 1,
+    ChaCha20Poly1305 = 2,
+    MlKem1024Aes256Gcm = 3,
 }
 
 public sealed record CarrierAssessment(
@@ -33,16 +46,25 @@ public sealed record CarrierAssessment(
 public sealed record EmbedResult(
     string OutputPath,
     CarrierAssessment Assessment,
+    EncryptionProfile EncryptionProfile,
     PayloadKind PayloadKind,
     long SecretBytes,
     long EmbeddedPackageBytes);
 
 public sealed record ExtractResult(
+    EncryptionProfile EncryptionProfile,
     PayloadKind PayloadKind,
     string? FileName,
     long DataBytes,
     string? TextContent,
     string? SavedFilePath);
+
+public sealed record PostQuantumKeyPairResult(
+    string PublicKeyPath,
+    string PrivateKeyPath,
+    int PublicKeyBytes,
+    int PrivateKeyBytes,
+    string Fingerprint);
 
 public static class PictureSteganographyService
 {
@@ -50,6 +72,9 @@ public static class PictureSteganographyService
     private const int SaltSize = 16;
     private const int NonceSize = 12;
     private const int TagSize = 16;
+    private const int AeadKeySize = 32;
+    private const int MlKemKeyWrapNonceSize = 12;
+    private const int MlKemKeyWrapTagSize = 16;
     private const int Pbkdf2Iterations = 350_000;
     private const byte CurrentVersion = 2;
     private const int BlockSize = 8;
@@ -68,7 +93,29 @@ public static class PictureSteganographyService
         return AnalyzeCarrier(bitmap);
     }
 
-    public static long EstimateRequiredContainerBytes(PayloadKind payloadKind, string? fileName, long dataLength)
+    public static IReadOnlyList<EncryptionProfile> SupportedEncryptionProfiles { get; } =
+    [
+        EncryptionProfile.Aes256Gcm,
+        EncryptionProfile.ChaCha20Poly1305,
+        EncryptionProfile.MlKem1024Aes256Gcm,
+    ];
+
+    public static string GetEncryptionProfileDisplayName(EncryptionProfile profile)
+    {
+        return profile switch
+        {
+            EncryptionProfile.Aes256Gcm => "AES-256-GCM（推荐，标准 AEAD）",
+            EncryptionProfile.ChaCha20Poly1305 => "ChaCha20-Poly1305（高强度 AEAD）",
+            EncryptionProfile.MlKem1024Aes256Gcm => "ML-KEM-1024 + AES-256-GCM（后量子接收者模式）",
+            _ => $"未知算法配置 ({(byte)profile})",
+        };
+    }
+
+    public static long EstimateRequiredContainerBytes(
+        PayloadKind payloadKind,
+        string? fileName,
+        long dataLength,
+        EncryptionProfile encryptionProfile = EncryptionProfile.Aes256Gcm)
     {
         if (dataLength < 0)
         {
@@ -81,10 +128,20 @@ public static class PictureSteganographyService
 
         long plainPayloadBytes = 1 + 1 + 2 + 8 + fileNameBytes + dataLength;
         long compressionAllowance = Math.Max(96, plainPayloadBytes / 100);
-        return HeaderSize + NonceSize + TagSize + plainPayloadBytes + compressionAllowance;
+        return HeaderSize + GetPackageOverheadBytes(encryptionProfile) + plainPayloadBytes + compressionAllowance;
     }
 
     public static EmbedResult EmbedText(string carrierImagePath, string text, string password, string outputPath)
+    {
+        return EmbedText(carrierImagePath, text, password, outputPath, EncryptionProfile.Aes256Gcm);
+    }
+
+    public static EmbedResult EmbedText(
+        string carrierImagePath,
+        string text,
+        string password,
+        string outputPath,
+        EncryptionProfile encryptionProfile)
     {
         if (string.IsNullOrEmpty(text))
         {
@@ -97,10 +154,21 @@ public static class PictureSteganographyService
             fileName: null,
             data: Encoding.UTF8.GetBytes(text),
             password,
-            outputPath);
+            outputPath,
+            encryptionProfile);
     }
 
     public static EmbedResult EmbedFile(string carrierImagePath, string secretFilePath, string password, string outputPath)
+    {
+        return EmbedFile(carrierImagePath, secretFilePath, password, outputPath, EncryptionProfile.Aes256Gcm);
+    }
+
+    public static EmbedResult EmbedFile(
+        string carrierImagePath,
+        string secretFilePath,
+        string password,
+        string outputPath,
+        EncryptionProfile encryptionProfile)
     {
         if (!File.Exists(secretFilePath))
         {
@@ -113,7 +181,52 @@ public static class PictureSteganographyService
             Path.GetFileName(secretFilePath),
             File.ReadAllBytes(secretFilePath),
             password,
-            outputPath);
+            outputPath,
+            encryptionProfile);
+    }
+
+    public static EmbedResult EmbedTextForRecipient(
+        string carrierImagePath,
+        string text,
+        string recipientPublicKeyPath,
+        string outputPath)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            throw new InvalidOperationException("文本载荷不能为空。");
+        }
+
+        return EmbedInternal(
+            carrierImagePath,
+            PayloadKind.Text,
+            fileName: null,
+            data: Encoding.UTF8.GetBytes(text),
+            password: null,
+            outputPath,
+            EncryptionProfile.MlKem1024Aes256Gcm,
+            recipientPublicKeyPath);
+    }
+
+    public static EmbedResult EmbedFileForRecipient(
+        string carrierImagePath,
+        string secretFilePath,
+        string recipientPublicKeyPath,
+        string outputPath)
+    {
+        if (!File.Exists(secretFilePath))
+        {
+            throw new FileNotFoundException("未找到秘密文件。", secretFilePath);
+        }
+
+        return EmbedInternal(
+            carrierImagePath,
+            PayloadKind.File,
+            Path.GetFileName(secretFilePath),
+            File.ReadAllBytes(secretFilePath),
+            password: null,
+            outputPath,
+            EncryptionProfile.MlKem1024Aes256Gcm,
+            recipientPublicKeyPath);
     }
 
     public static ExtractResult Extract(string stegoImagePath, string password, string outputDirectory)
@@ -136,7 +249,11 @@ public static class PictureSteganographyService
         }
 
         byte[] header = ReadCandidateBits(bitmap.Pixels, layout.CandidateByteIndices, HeaderSize, candidateStartIndex: 0);
-        ValidateHeader(header, layout.CandidateByteIndices.Length, out var salt, out int encryptedPackageLength);
+        ValidateHeader(header, layout.CandidateByteIndices.Length, out var encryptionProfile, out var salt, out int encryptedPackageLength);
+        if (encryptionProfile == EncryptionProfile.MlKem1024Aes256Gcm)
+        {
+            throw new InvalidOperationException("该图片使用后量子接收者模式，请改用 ML-KEM 私钥提取。");
+        }
 
         byte[] encryptedPackage = ReadScatteredCandidateBits(
             bitmap.Pixels,
@@ -146,26 +263,11 @@ public static class PictureSteganographyService
             password,
             salt);
 
-        if (encryptedPackageLength < NonceSize + TagSize)
-        {
-            throw new InvalidOperationException("嵌入容器不完整。");
-        }
-
-        byte[] nonce = encryptedPackage.AsSpan(0, NonceSize).ToArray();
-        byte[] tag = encryptedPackage.AsSpan(NonceSize, TagSize).ToArray();
-        byte[] ciphertext = encryptedPackage.AsSpan(NonceSize + TagSize).ToArray();
-
-        byte[] key = DeriveAesKey(password, salt);
         try
         {
-            byte[] compressedPayload = new byte[ciphertext.Length];
-            using (var aes = new AesGcm(key, TagSize))
-            {
-                aes.Decrypt(nonce, ciphertext, tag, compressedPayload);
-            }
-
+            byte[] compressedPayload = DecryptPasswordPackage(encryptedPackage, password, salt, encryptionProfile);
             byte[] plainPayload = Decompress(compressedPayload);
-            return DecodePayload(plainPayload, outputDirectory);
+            return DecodePayload(plainPayload, outputDirectory, encryptionProfile);
         }
         catch (CryptographicException ex)
         {
@@ -175,9 +277,107 @@ public static class PictureSteganographyService
         {
             throw new InvalidOperationException("载荷解压失败。图片可能在嵌入后被修改过。", ex);
         }
+    }
+
+    public static ExtractResult ExtractWithPrivateKey(string stegoImagePath, string privateKeyPath, string outputDirectory)
+    {
+        if (!File.Exists(stegoImagePath))
+        {
+            throw new FileNotFoundException("未找到隐写图片。", stegoImagePath);
+        }
+
+        if (!File.Exists(privateKeyPath))
+        {
+            throw new FileNotFoundException("未找到 ML-KEM 私钥文件。", privateKeyPath);
+        }
+
+        var bitmap = LoadBitmap(stegoImagePath);
+        CandidateLayout layout = BuildCandidateLayout(bitmap);
+        if (layout.CandidateByteIndices.Length < HeaderSize * 8)
+        {
+            throw new InvalidOperationException("该图片未提供足够的自适应载体位置，无法容纳有效头部信息。");
+        }
+
+        byte[] header = ReadCandidateBits(bitmap.Pixels, layout.CandidateByteIndices, HeaderSize, candidateStartIndex: 0);
+        ValidateHeader(header, layout.CandidateByteIndices.Length, out var encryptionProfile, out var salt, out int encryptedPackageLength);
+        if (encryptionProfile != EncryptionProfile.MlKem1024Aes256Gcm)
+        {
+            throw new InvalidOperationException("该图片不是后量子接收者模式，请改用密码提取。");
+        }
+
+        MLKemPrivateKeyParameters privateKey = LoadMlKemPrivateKey(privateKeyPath);
+        byte[] publicKeyEncoding = privateKey.GetPublicKeyEncoded();
+        string scatterSecret = CreatePostQuantumScatterSecret(publicKeyEncoding);
+
+        byte[] encryptedPackage = ReadScatteredCandidateBits(
+            bitmap.Pixels,
+            layout.CandidateByteIndices,
+            encryptedPackageLength,
+            headerBitCount: HeaderSize * 8,
+            scatterSecret,
+            salt);
+
+        try
+        {
+            byte[] compressedPayload = DecryptPostQuantumPackage(encryptedPackage, privateKey);
+            byte[] plainPayload = Decompress(compressedPayload);
+            return DecodePayload(plainPayload, outputDirectory, encryptionProfile);
+        }
+        catch (CryptographicException ex)
+        {
+            throw new InvalidOperationException("ML-KEM 私钥校验失败，或隐藏载荷已经损坏。", ex);
+        }
+        catch (InvalidDataException ex)
+        {
+            throw new InvalidOperationException("载荷解压失败。图片可能在嵌入后被修改过。", ex);
+        }
         finally
         {
-            CryptographicOperations.ZeroMemory(key);
+            CryptographicOperations.ZeroMemory(publicKeyEncoding);
+        }
+    }
+
+    public static PostQuantumKeyPairResult GenerateMlKem1024KeyPair(string outputDirectory, string baseName = "PictureEncryption")
+    {
+        if (string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            throw new InvalidOperationException("密钥保存目录不能为空。");
+        }
+
+        Directory.CreateDirectory(outputDirectory);
+        string safeBaseName = string.Join("_", baseName.Split(Path.GetInvalidFileNameChars(), StringSplitOptions.RemoveEmptyEntries)).Trim();
+        if (string.IsNullOrWhiteSpace(safeBaseName))
+        {
+            safeBaseName = "PictureEncryption";
+        }
+
+        string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        string publicKeyPath = GetUniqueOutputPath(outputDirectory, $"{safeBaseName}-MLKEM1024-public-{stamp}.pem");
+        string privateKeyPath = GetUniqueOutputPath(outputDirectory, $"{safeBaseName}-MLKEM1024-private-{stamp}.pem");
+
+        var generator = new MLKemKeyPairGenerator();
+        generator.Init(new MLKemKeyGenerationParameters(new SecureRandom(), MLKemParameters.ml_kem_1024));
+        AsymmetricCipherKeyPair keyPair = generator.GenerateKeyPair();
+        var publicKey = (MLKemPublicKeyParameters)keyPair.Public;
+        var privateKey = (MLKemPrivateKeyParameters)keyPair.Private;
+
+        byte[] publicKeyEncoding = publicKey.GetEncoded();
+        byte[] privateKeyEncoding = privateKey.GetEncoded();
+        try
+        {
+            WritePemKeyFile(publicKeyPath, "PES ML-KEM-1024 PUBLIC KEY", publicKeyEncoding);
+            WritePemKeyFile(privateKeyPath, "PES ML-KEM-1024 PRIVATE KEY", privateKeyEncoding);
+            return new PostQuantumKeyPairResult(
+                publicKeyPath,
+                privateKeyPath,
+                publicKeyEncoding.Length,
+                privateKeyEncoding.Length,
+                CreateKeyFingerprint(publicKeyEncoding));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(publicKeyEncoding);
+            CryptographicOperations.ZeroMemory(privateKeyEncoding);
         }
     }
 
@@ -186,10 +386,20 @@ public static class PictureSteganographyService
         PayloadKind payloadKind,
         string? fileName,
         byte[] data,
-        string password,
-        string outputPath)
+        string? password,
+        string outputPath,
+        EncryptionProfile encryptionProfile,
+        string? recipientPublicKeyPath = null)
     {
-        if (string.IsNullOrWhiteSpace(password))
+        ValidateEncryptionProfile(encryptionProfile);
+        if (encryptionProfile == EncryptionProfile.MlKem1024Aes256Gcm)
+        {
+            if (string.IsNullOrWhiteSpace(recipientPublicKeyPath) || !File.Exists(recipientPublicKeyPath))
+            {
+                throw new InvalidOperationException("后量子接收者模式需要选择有效的 ML-KEM 公钥文件。");
+            }
+        }
+        else if (string.IsNullOrWhiteSpace(password))
         {
             throw new InvalidOperationException("密码不能为空。");
         }
@@ -206,26 +416,29 @@ public static class PictureSteganographyService
         byte[] compressedPayload = Compress(plainPayload);
 
         byte[] salt = RandomNumberGenerator.GetBytes(SaltSize);
-        byte[] nonce = RandomNumberGenerator.GetBytes(NonceSize);
-        byte[] key = DeriveAesKey(password, salt);
-
-        byte[] ciphertext = new byte[compressedPayload.Length];
-        byte[] tag = new byte[TagSize];
-
-        try
+        string scatterSecret;
+        byte[] encryptedPackage;
+        if (encryptionProfile == EncryptionProfile.MlKem1024Aes256Gcm)
         {
-            using (var aes = new AesGcm(key, TagSize))
+            MLKemPublicKeyParameters publicKey = LoadMlKemPublicKey(recipientPublicKeyPath!);
+            byte[] publicKeyEncoding = publicKey.GetEncoded();
+            try
             {
-                aes.Encrypt(nonce, compressedPayload, ciphertext, tag);
+                scatterSecret = CreatePostQuantumScatterSecret(publicKeyEncoding);
+                encryptedPackage = EncryptPostQuantumPackage(compressedPayload, publicKey);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(publicKeyEncoding);
             }
         }
-        finally
+        else
         {
-            CryptographicOperations.ZeroMemory(key);
+            scatterSecret = password!;
+            encryptedPackage = EncryptPasswordPackage(compressedPayload, password!, salt, encryptionProfile);
         }
 
-        byte[] encryptedPackage = BuildEncryptedPackage(nonce, tag, ciphertext);
-        byte[] header = BuildHeader(salt, encryptedPackage.Length, layout.CandidateByteIndices.Length);
+        byte[] header = BuildHeader(salt, encryptedPackage.Length, layout.CandidateByteIndices.Length, encryptionProfile);
         long requiredContainerBytes = header.Length + encryptedPackage.Length;
 
         if (requiredContainerBytes > assessment.RecommendedContainerBytes)
@@ -241,23 +454,29 @@ public static class PictureSteganographyService
                 $"自适应载体容量不足。需要 {FormatBytes(requiredContainerBytes)}，当前可用 {FormatBytes(assessment.AdaptiveCapacityBytes)}。");
         }
 
-        var adjustmentBits = DeterministicBitSource.Create(password, salt, "adjust-v2");
+        var adjustmentBits = DeterministicBitSource.Create(scatterSecret, salt, "adjust-v2");
         WriteCandidateBitsMatching(bitmap.Pixels, layout.CandidateByteIndices, header, candidateStartIndex: 0, adjustmentBits);
         WriteScatteredCandidateBitsMatching(
             bitmap.Pixels,
             layout.CandidateByteIndices,
             encryptedPackage,
             headerBitCount: HeaderSize * 8,
-            password,
+            scatterSecret,
             salt,
             adjustmentBits);
 
-        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        string? outputDirectory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            Directory.CreateDirectory(outputDirectory);
+        }
+
         SaveAsPng(bitmap, outputPath);
 
         return new EmbedResult(
             outputPath,
             assessment,
+            encryptionProfile,
             payloadKind,
             data.LongLength,
             requiredContainerBytes);
@@ -281,7 +500,7 @@ public static class PictureSteganographyService
         return stream.ToArray();
     }
 
-    private static ExtractResult DecodePayload(byte[] plainPayload, string outputDirectory)
+    private static ExtractResult DecodePayload(byte[] plainPayload, string outputDirectory, EncryptionProfile encryptionProfile)
     {
         using var stream = new MemoryStream(plainPayload);
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
@@ -313,6 +532,7 @@ public static class PictureSteganographyService
         if (payloadKind == PayloadKind.Text)
         {
             return new ExtractResult(
+                encryptionProfile,
                 payloadKind,
                 fileName,
                 data.LongLength,
@@ -324,7 +544,7 @@ public static class PictureSteganographyService
         string safeFileName = GetSafeFileName(fileName);
         string savedPath = GetUniqueOutputPath(outputDirectory, safeFileName);
         File.WriteAllBytes(savedPath, data);
-        return new ExtractResult(payloadKind, safeFileName, data.LongLength, null, savedPath);
+        return new ExtractResult(encryptionProfile, payloadKind, safeFileName, data.LongLength, null, savedPath);
     }
 
     private static string GetSafeFileName(string? fileName)
@@ -358,20 +578,284 @@ public static class PictureSteganographyService
         return package;
     }
 
-    private static byte[] BuildHeader(byte[] salt, int encryptedPackageLength, int candidateCount)
+    private static byte[] EncryptPasswordPackage(
+        byte[] compressedPayload,
+        string password,
+        byte[] salt,
+        EncryptionProfile encryptionProfile)
+    {
+        byte[] nonce = RandomNumberGenerator.GetBytes(NonceSize);
+        byte[] key = DeriveKey(password, salt);
+        byte[] package;
+
+        try
+        {
+            package = encryptionProfile switch
+            {
+                EncryptionProfile.Aes256Gcm => EncryptAesGcmPackage(compressedPayload, key, nonce),
+                EncryptionProfile.ChaCha20Poly1305 => EncryptChaCha20Poly1305Package(compressedPayload, key, nonce),
+                _ => throw new InvalidOperationException("该加密配置不支持密码模式。"),
+            };
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(key);
+        }
+
+        return package;
+    }
+
+    private static byte[] EncryptAesGcmPackage(byte[] plaintext, byte[] key, byte[] nonce)
+    {
+        byte[] ciphertext = EncryptAesGcm(plaintext, key, nonce, out byte[] tag);
+        return BuildEncryptedPackage(nonce, tag, ciphertext);
+    }
+
+    private static byte[] DecryptPasswordPackage(
+        byte[] encryptedPackage,
+        string password,
+        byte[] salt,
+        EncryptionProfile encryptionProfile)
+    {
+        if (encryptedPackage.Length < NonceSize + TagSize)
+        {
+            throw new InvalidOperationException("嵌入容器不完整。");
+        }
+
+        byte[] nonce = encryptedPackage.AsSpan(0, NonceSize).ToArray();
+        byte[] tag = encryptedPackage.AsSpan(NonceSize, TagSize).ToArray();
+        byte[] ciphertext = encryptedPackage.AsSpan(NonceSize + TagSize).ToArray();
+        byte[] key = DeriveKey(password, salt);
+        try
+        {
+            return encryptionProfile switch
+            {
+                EncryptionProfile.Aes256Gcm => DecryptAesGcm(ciphertext, key, nonce, tag),
+                EncryptionProfile.ChaCha20Poly1305 => DecryptChaCha20Poly1305(ciphertext, key, nonce, tag),
+                _ => throw new InvalidOperationException("该加密配置不支持密码模式。"),
+            };
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(key);
+        }
+    }
+
+    private static byte[] EncryptPostQuantumPackage(byte[] compressedPayload, MLKemPublicKeyParameters publicKey)
+    {
+        var encapsulator = new MLKemEncapsulator(MLKemParameters.ml_kem_1024);
+        encapsulator.Init(publicKey);
+
+        byte[] encapsulation = new byte[encapsulator.EncapsulationLength];
+        byte[] sharedSecret = new byte[encapsulator.SecretLength];
+        byte[] contentKey = RandomNumberGenerator.GetBytes(AeadKeySize);
+        byte[] wrappedKeyNonce = RandomNumberGenerator.GetBytes(MlKemKeyWrapNonceSize);
+        byte[] payloadNonce = RandomNumberGenerator.GetBytes(NonceSize);
+
+        try
+        {
+            encapsulator.Encapsulate(encapsulation, 0, encapsulation.Length, sharedSecret, 0, sharedSecret.Length);
+            byte[] wrappingKey = DeriveMlKemWrappingKey(sharedSecret, encapsulation);
+            byte[] wrappedKeyCiphertext = new byte[contentKey.Length];
+            byte[] wrappedKeyTag = new byte[MlKemKeyWrapTagSize];
+            byte[] payloadCiphertext = new byte[compressedPayload.Length];
+            byte[] payloadTag = new byte[TagSize];
+
+            try
+            {
+                using (var aes = new AesGcm(wrappingKey, MlKemKeyWrapTagSize))
+                {
+                    aes.Encrypt(wrappedKeyNonce, contentKey, wrappedKeyCiphertext, wrappedKeyTag, encapsulation);
+                }
+
+                using (var aes = new AesGcm(contentKey, TagSize))
+                {
+                    aes.Encrypt(payloadNonce, compressedPayload, payloadCiphertext, payloadTag);
+                }
+
+                using var stream = new MemoryStream();
+                using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+                writer.Write((ushort)encapsulation.Length);
+                writer.Write(encapsulation);
+                writer.Write(wrappedKeyNonce);
+                writer.Write(wrappedKeyTag);
+                writer.Write(wrappedKeyCiphertext);
+                writer.Write(payloadNonce);
+                writer.Write(payloadTag);
+                writer.Write(payloadCiphertext);
+                writer.Flush();
+                return stream.ToArray();
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(wrappingKey);
+                CryptographicOperations.ZeroMemory(wrappedKeyCiphertext);
+                CryptographicOperations.ZeroMemory(wrappedKeyTag);
+                CryptographicOperations.ZeroMemory(payloadCiphertext);
+                CryptographicOperations.ZeroMemory(payloadTag);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encapsulation);
+            CryptographicOperations.ZeroMemory(sharedSecret);
+            CryptographicOperations.ZeroMemory(contentKey);
+            CryptographicOperations.ZeroMemory(wrappedKeyNonce);
+            CryptographicOperations.ZeroMemory(payloadNonce);
+        }
+    }
+
+    private static byte[] DecryptPostQuantumPackage(byte[] encryptedPackage, MLKemPrivateKeyParameters privateKey)
+    {
+        using var stream = new MemoryStream(encryptedPackage);
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
+
+        int encapsulationLength = reader.ReadUInt16();
+        if (encapsulationLength <= 0 || encapsulationLength > encryptedPackage.Length)
+        {
+            throw new InvalidOperationException("ML-KEM 封装体长度无效。");
+        }
+
+        byte[] encapsulation = reader.ReadBytes(encapsulationLength);
+        byte[] wrappedKeyNonce = reader.ReadBytes(MlKemKeyWrapNonceSize);
+        byte[] wrappedKeyTag = reader.ReadBytes(MlKemKeyWrapTagSize);
+        byte[] wrappedKeyCiphertext = reader.ReadBytes(AeadKeySize);
+        byte[] payloadNonce = reader.ReadBytes(NonceSize);
+        byte[] payloadTag = reader.ReadBytes(TagSize);
+        byte[] payloadCiphertext = reader.ReadBytes((int)(stream.Length - stream.Position));
+
+        if (encapsulation.Length != encapsulationLength ||
+            wrappedKeyNonce.Length != MlKemKeyWrapNonceSize ||
+            wrappedKeyTag.Length != MlKemKeyWrapTagSize ||
+            wrappedKeyCiphertext.Length != AeadKeySize ||
+            payloadNonce.Length != NonceSize ||
+            payloadTag.Length != TagSize ||
+            payloadCiphertext.Length == 0)
+        {
+            throw new InvalidOperationException("后量子嵌入容器不完整。");
+        }
+
+        var decapsulator = new MLKemDecapsulator(MLKemParameters.ml_kem_1024);
+        decapsulator.Init(privateKey);
+        byte[] sharedSecret = new byte[decapsulator.SecretLength];
+        byte[] contentKey = new byte[AeadKeySize];
+
+        try
+        {
+            decapsulator.Decapsulate(encapsulation, 0, encapsulation.Length, sharedSecret, 0, sharedSecret.Length);
+            byte[] wrappingKey = DeriveMlKemWrappingKey(sharedSecret, encapsulation);
+            try
+            {
+                using (var aes = new AesGcm(wrappingKey, MlKemKeyWrapTagSize))
+                {
+                    aes.Decrypt(wrappedKeyNonce, wrappedKeyCiphertext, wrappedKeyTag, contentKey, encapsulation);
+                }
+
+                byte[] compressedPayload = new byte[payloadCiphertext.Length];
+                using (var aes = new AesGcm(contentKey, TagSize))
+                {
+                    aes.Decrypt(payloadNonce, payloadCiphertext, payloadTag, compressedPayload);
+                }
+
+                return compressedPayload;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(wrappingKey);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encapsulation);
+            CryptographicOperations.ZeroMemory(wrappedKeyNonce);
+            CryptographicOperations.ZeroMemory(wrappedKeyTag);
+            CryptographicOperations.ZeroMemory(wrappedKeyCiphertext);
+            CryptographicOperations.ZeroMemory(payloadNonce);
+            CryptographicOperations.ZeroMemory(payloadTag);
+            CryptographicOperations.ZeroMemory(payloadCiphertext);
+            CryptographicOperations.ZeroMemory(sharedSecret);
+            CryptographicOperations.ZeroMemory(contentKey);
+        }
+    }
+
+    private static byte[] EncryptAesGcm(byte[] plaintext, byte[] key, byte[] nonce, out byte[] tag)
+    {
+        byte[] ciphertext = new byte[plaintext.Length];
+        tag = new byte[TagSize];
+        using var aes = new AesGcm(key, TagSize);
+        aes.Encrypt(nonce, plaintext, ciphertext, tag);
+        return ciphertext;
+    }
+
+    private static byte[] DecryptAesGcm(byte[] ciphertext, byte[] key, byte[] nonce, byte[] tag)
+    {
+        byte[] plaintext = new byte[ciphertext.Length];
+        using var aes = new AesGcm(key, TagSize);
+        aes.Decrypt(nonce, ciphertext, tag, plaintext);
+        return plaintext;
+    }
+
+    private static byte[] EncryptChaCha20Poly1305Package(byte[] plaintext, byte[] key, byte[] nonce)
+    {
+        byte[] output = new byte[plaintext.Length + TagSize];
+        var cipher = new Org.BouncyCastle.Crypto.Modes.ChaCha20Poly1305();
+        cipher.Init(true, new AeadParameters(new KeyParameter(key), TagSize * 8, nonce));
+        try
+        {
+            int written = cipher.ProcessBytes(plaintext, 0, plaintext.Length, output, 0);
+            cipher.DoFinal(output, written);
+        }
+        catch (InvalidCipherTextException ex)
+        {
+            throw new CryptographicException("ChaCha20-Poly1305 加密失败。", ex);
+        }
+
+        byte[] ciphertext = output.AsSpan(0, plaintext.Length).ToArray();
+        byte[] tag = output.AsSpan(plaintext.Length, TagSize).ToArray();
+        return BuildEncryptedPackage(nonce, tag, ciphertext);
+    }
+
+    private static byte[] DecryptChaCha20Poly1305(byte[] ciphertext, byte[] key, byte[] nonce, byte[] tag)
+    {
+        byte[] input = new byte[ciphertext.Length + tag.Length];
+        ciphertext.CopyTo(input.AsSpan(0, ciphertext.Length));
+        tag.CopyTo(input.AsSpan(ciphertext.Length, tag.Length));
+
+        byte[] plaintext = new byte[ciphertext.Length];
+        var cipher = new Org.BouncyCastle.Crypto.Modes.ChaCha20Poly1305();
+        cipher.Init(false, new AeadParameters(new KeyParameter(key), TagSize * 8, nonce));
+        try
+        {
+            int written = cipher.ProcessBytes(input, 0, input.Length, plaintext, 0);
+            cipher.DoFinal(plaintext, written);
+        }
+        catch (InvalidCipherTextException ex)
+        {
+            throw new CryptographicException("ChaCha20-Poly1305 认证失败。", ex);
+        }
+
+        return plaintext;
+    }
+
+    private static byte[] BuildHeader(byte[] salt, int encryptedPackageLength, int candidateCount, EncryptionProfile encryptionProfile)
     {
         byte[] header = new byte[HeaderSize];
         Magic.CopyTo(header, 0);
         header[4] = CurrentVersion;
         header[5] = BlockSize;
-        header[6] = 1;
+        header[6] = (byte)encryptionProfile;
         salt.CopyTo(header.AsSpan(8, SaltSize));
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(24, sizeof(int)), encryptedPackageLength);
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(28, sizeof(int)), candidateCount);
         return header;
     }
 
-    private static void ValidateHeader(byte[] header, int candidateCount, out byte[] salt, out int encryptedPackageLength)
+    private static void ValidateHeader(
+        byte[] header,
+        int candidateCount,
+        out EncryptionProfile encryptionProfile,
+        out byte[] salt,
+        out int encryptedPackageLength)
     {
         if (!header.AsSpan(0, Magic.Length).SequenceEqual(Magic))
         {
@@ -387,6 +871,9 @@ public static class PictureSteganographyService
         {
             throw new InvalidOperationException("载体布局配置与当前自适应引擎不匹配。");
         }
+
+        encryptionProfile = (EncryptionProfile)header[6];
+        ValidateEncryptionProfile(encryptionProfile);
 
         salt = header.AsSpan(8, SaltSize).ToArray();
         encryptedPackageLength = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(24, sizeof(int)));
@@ -409,14 +896,112 @@ public static class PictureSteganographyService
         }
     }
 
-    private static byte[] DeriveAesKey(string password, byte[] salt)
+    private static void ValidateEncryptionProfile(EncryptionProfile encryptionProfile)
+    {
+        if (!Enum.IsDefined(encryptionProfile))
+        {
+            throw new InvalidOperationException($"不支持的加密算法配置：{(byte)encryptionProfile}。");
+        }
+    }
+
+    private static int GetPackageOverheadBytes(EncryptionProfile encryptionProfile)
+    {
+        ValidateEncryptionProfile(encryptionProfile);
+        return encryptionProfile switch
+        {
+            EncryptionProfile.Aes256Gcm => NonceSize + TagSize,
+            EncryptionProfile.ChaCha20Poly1305 => NonceSize + TagSize,
+            EncryptionProfile.MlKem1024Aes256Gcm => sizeof(ushort) + 1568 + MlKemKeyWrapNonceSize + MlKemKeyWrapTagSize + AeadKeySize + NonceSize + TagSize,
+            _ => throw new InvalidOperationException($"不支持的加密算法配置：{(byte)encryptionProfile}。"),
+        };
+    }
+
+    private static byte[] DeriveKey(string password, byte[] salt)
     {
         return Rfc2898DeriveBytes.Pbkdf2(
             password,
             salt,
             Pbkdf2Iterations,
             HashAlgorithmName.SHA256,
-            32);
+            AeadKeySize);
+    }
+
+    private static byte[] DeriveMlKemWrappingKey(byte[] sharedSecret, byte[] encapsulation)
+    {
+        using var stream = new MemoryStream();
+        stream.Write(Encoding.ASCII.GetBytes("PES-MLKEM1024-WRAP-v1"));
+        stream.Write(sharedSecret);
+        stream.Write(encapsulation);
+        return SHA256.HashData(stream.ToArray());
+    }
+
+    private static string CreatePostQuantumScatterSecret(byte[] publicKeyEncoding)
+    {
+        byte[] hash = SHA256.HashData(publicKeyEncoding);
+        return "mlkem1024:" + Convert.ToHexString(hash);
+    }
+
+    private static string CreateKeyFingerprint(byte[] publicKeyEncoding)
+    {
+        byte[] hash = SHA256.HashData(publicKeyEncoding);
+        return Convert.ToHexString(hash.AsSpan(0, 16)).ToLowerInvariant();
+    }
+
+    private static MLKemPublicKeyParameters LoadMlKemPublicKey(string path)
+    {
+        byte[] encoding = ReadPemOrRawKeyFile(path, "PES ML-KEM-1024 PUBLIC KEY");
+        try
+        {
+            return MLKemPublicKeyParameters.FromEncoding(MLKemParameters.ml_kem_1024, encoding);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encoding);
+        }
+    }
+
+    private static MLKemPrivateKeyParameters LoadMlKemPrivateKey(string path)
+    {
+        byte[] encoding = ReadPemOrRawKeyFile(path, "PES ML-KEM-1024 PRIVATE KEY");
+        try
+        {
+            return MLKemPrivateKeyParameters.FromEncoding(MLKemParameters.ml_kem_1024, encoding);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encoding);
+        }
+    }
+
+    private static void WritePemKeyFile(string path, string label, byte[] keyBytes)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"-----BEGIN {label}-----");
+        builder.AppendLine(Convert.ToBase64String(keyBytes, Base64FormattingOptions.InsertLineBreaks));
+        builder.AppendLine($"-----END {label}-----");
+        File.WriteAllText(path, builder.ToString(), Encoding.ASCII);
+    }
+
+    private static byte[] ReadPemOrRawKeyFile(string path, string expectedLabel)
+    {
+        byte[] fileBytes = File.ReadAllBytes(path);
+        string text = Encoding.ASCII.GetString(fileBytes);
+        string beginMarker = $"-----BEGIN {expectedLabel}-----";
+        string endMarker = $"-----END {expectedLabel}-----";
+
+        int begin = text.IndexOf(beginMarker, StringComparison.Ordinal);
+        int end = text.IndexOf(endMarker, StringComparison.Ordinal);
+        if (begin >= 0 && end > begin)
+        {
+            int base64Start = begin + beginMarker.Length;
+            string base64 = text[base64Start..end]
+                .Replace("\r", string.Empty, StringComparison.Ordinal)
+                .Replace("\n", string.Empty, StringComparison.Ordinal)
+                .Trim();
+            return Convert.FromBase64String(base64);
+        }
+
+        return fileBytes;
     }
 
     private static byte[] Compress(byte[] input)
