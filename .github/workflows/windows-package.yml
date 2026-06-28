@@ -12,7 +12,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-package:
@@ -123,3 +123,32 @@ jobs:
             ${{ env.PUBLISH_DIR }}
             ${{ env.INSTALLER_DIR }}
           if-no-files-found: error
+
+      - name: 创建 GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $tagName = "${{ github.ref_name }}"
+          $releaseTitle = "图片隐写加密工作台 $tagName"
+          $notes = @(
+            "## 图片隐写加密工作台 $tagName",
+            "",
+            "本次发布包含 Windows x64 单文件 EXE 和带图标安装包。",
+            "",
+            "- PictureEncryptionApp.exe：免安装单文件程序",
+            "- PictureEncryptionApp-Setup-$version.exe：Windows 安装包",
+            "",
+            "使用说明：",
+            "- 建议优先下载安装包。",
+            "- 隐写输出请保持 PNG 格式。",
+            "- 不要将隐写输出重新保存为 JPEG。"
+          ) -join "`n"
+
+          gh release create $tagName `
+            "$env:PUBLISH_DIR\PictureEncryptionApp.exe" `
+            "$env:INSTALLER_DIR\PictureEncryptionApp-Setup-$version.exe" `
+            --title $releaseTitle `
+            --notes $notes

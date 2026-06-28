@@ -120,6 +120,8 @@ git push origin v0.1.0
 - `PictureEncryptionApp.exe`
 - `PictureEncryptionApp-Setup-<version>.exe`
 
+当通过 `v*` 标签触发构建时，工作流还会自动创建 GitHub Release，并把 EXE 和安装包作为 Release 附件上传。
+
 ## 安装包说明
 
 安装包脚本位于：
