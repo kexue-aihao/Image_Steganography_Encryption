@@ -100,10 +100,19 @@ jobs:
             throw "未找到 Inno Setup 编译器: $iscc"
           }
 
+          if (-not (Test-Path "$env:PUBLISH_DIR\PictureEncryptionApp.exe")) {
+            throw "未找到已发布的 EXE: $env:PUBLISH_DIR\PictureEncryptionApp.exe"
+          }
+
+          if (-not (Test-Path "${{ github.workspace }}\PictureEncryptionApp\Assets\AppIcon.ico")) {
+            throw "未找到安装包图标: ${{ github.workspace }}\PictureEncryptionApp\Assets\AppIcon.ico"
+          }
+
           & $iscc `
             "/DMyAppVersion=${{ steps.meta.outputs.version }}" `
             "/DMyPublishDir=$env:PUBLISH_DIR" `
             "/DMyOutputDir=$env:INSTALLER_DIR" `
+            "/DMyIconFile=${{ github.workspace }}\PictureEncryptionApp\Assets\AppIcon.ico" `
             "installer\PictureEncryptionApp.iss"
 
       - name: 上传发布产物

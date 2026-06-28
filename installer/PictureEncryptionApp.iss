@@ -14,6 +14,10 @@
   #define MyOutputDir "..\\Release\\installer"
 #endif
 
+#ifndef MyIconFile
+  #define MyIconFile "..\\PictureEncryptionApp\\Assets\\AppIcon.ico"
+#endif
+
 [Setup]
 AppId={{A7F88580-61A5-4D91-8406-8CF29E6A69DA}
 AppName={#MyAppName}
@@ -25,7 +29,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 OutputDir={#MyOutputDir}
 OutputBaseFilename=PictureEncryptionApp-Setup-{#MyAppVersion}
-SetupIconFile=..\PictureEncryptionApp\Assets\AppIcon.ico
+SetupIconFile={#MyIconFile}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -34,7 +38,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "default"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: unchecked
