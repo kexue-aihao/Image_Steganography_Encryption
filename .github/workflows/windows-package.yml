@@ -1,0 +1,82 @@
+name: Windows Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 应用版本号，例如 1.0.0
+        required: true
+        default: 1.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  build-package:
+    name: 构建并打包 Windows 安装包
+    runs-on: windows-latest
+    env:
+      PROJECT_PATH: PictureEncryptionApp/PictureEncryptionApp.csproj
+      PUBLISH_DIR: ${{ github.workspace }}\Release\publish
+      INSTALLER_DIR: ${{ github.workspace }}\Release\installer
+      APP_VERSION: ${{ inputs.app_version }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 准备输出目录
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:PUBLISH_DIR | Out-Null
+          New-Item -ItemType Directory -Force -Path $env:INSTALLER_DIR | Out-Null
+
+      - name: 还原依赖
+        run: dotnet restore ${{ env.PROJECT_PATH }}
+
+      - name: 构建工程
+        run: dotnet build ${{ env.PROJECT_PATH }} -c Release --no-restore
+
+      - name: 发布单文件 EXE
+        shell: pwsh
+        run: |
+          dotnet publish $env:PROJECT_PATH `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o $env:PUBLISH_DIR
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: 编译安装包
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "未找到 Inno Setup 编译器: $iscc"
+          }
+
+          & $iscc `
+            "/DMyAppVersion=$env:APP_VERSION" `
+            "/DMyPublishDir=$env:PUBLISH_DIR" `
+            "/DMyOutputDir=$env:INSTALLER_DIR" `
+            "installer\PictureEncryptionApp.iss"
+
+      - name: 上传发布产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: PictureEncryptionApp-${{ inputs.app_version }}
+          path: |
+            ${{ env.PUBLISH_DIR }}
+            ${{ env.INSTALLER_DIR }}
+          if-no-files-found: error
