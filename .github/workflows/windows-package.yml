@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       app_version:
-        description: 应用版本号，例如 1.0.0
+        description: 应用版本号，例如 0.1.0
         required: true
-        default: 1.0.0
+        default: 0.1.0
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -17,13 +20,40 @@ jobs:
     runs-on: windows-latest
     env:
       PROJECT_PATH: PictureEncryptionApp/PictureEncryptionApp.csproj
-      PUBLISH_DIR: ${{ github.workspace }}\Release\publish
-      INSTALLER_DIR: ${{ github.workspace }}\Release\installer
-      APP_VERSION: ${{ inputs.app_version }}
+      PUBLISH_DIR: ${{ runner.temp }}\PictureEncryptionApp\publish
+      INSTALLER_DIR: ${{ runner.temp }}\PictureEncryptionApp\installer
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.app_version }}"
+            $tagName = ""
+          }
+          else {
+            $tagName = "${{ github.ref_name }}"
+            if (-not $tagName.StartsWith("v")) {
+              throw "标签名必须以 v 开头，例如 v0.1.0"
+            }
+
+            $version = $tagName.Substring(1)
+          }
+
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "版本号不能为空。"
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+([\-+][0-9A-Za-z\.-]+)?$') {
+            throw "版本号格式不正确。请使用例如 0.1.0、0.1.0-rc1 这样的格式。"
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "artifact_name=PictureEncryptionApp-$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: 安装 .NET 8 SDK
         uses: actions/setup-dotnet@v4
@@ -67,7 +97,7 @@ jobs:
           }
 
           & $iscc `
-            "/DMyAppVersion=$env:APP_VERSION" `
+            "/DMyAppVersion=${{ steps.meta.outputs.version }}" `
             "/DMyPublishDir=$env:PUBLISH_DIR" `
             "/DMyOutputDir=$env:INSTALLER_DIR" `
             "installer\PictureEncryptionApp.iss"
@@ -75,7 +105,7 @@ jobs:
       - name: 上传发布产物
         uses: actions/upload-artifact@v4
         with:
-          name: PictureEncryptionApp-${{ inputs.app_version }}
+          name: ${{ steps.meta.outputs.artifact_name }}
           path: |
             ${{ env.PUBLISH_DIR }}
             ${{ env.INSTALLER_DIR }}
